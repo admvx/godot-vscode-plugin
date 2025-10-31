@@ -116,6 +116,31 @@ export default class GDScriptLanguageClient extends LanguageClient {
 				{ scheme: "file", language: "gdscript" },
 				{ scheme: "untitled", language: "gdscript" },
 			],
+			middleware: {
+				// Strip `(`, `()` from ends of method completion items for better consistency with other LSP extensions
+				provideCompletionItem: async (document, position, context, token, next) => {
+					const result = await next(document, position, context, token);
+					const isCompletionList = !Array.isArray(result);
+					const items = isCompletionList ? (result ? result.items : []) : result;
+					if (!items) return result;
+
+					for (const item of items) {
+						const insertText = item.insertText;
+						if (typeof insertText === 'string') {
+							if (insertText.endsWith('(')) {
+								item.insertText = insertText.slice(0, -1);
+							} else if (insertText.endsWith('()')) {
+								item.insertText = insertText.slice(0, -2);
+							}
+						}
+					}
+					
+					// Reassemble completion list if necessary
+					if (isCompletionList) return { ...result, items };
+					
+					return items;
+				},
+			},
 		};
 
 		super("GDScriptLanguageClient", serverOptions, clientOptions);
