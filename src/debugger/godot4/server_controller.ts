@@ -20,9 +20,10 @@ import { GodotStackFrame, GodotVariable } from "../debug_runtime";
 import { AttachRequestArguments, LaunchRequestArguments, pinnedScene } from "../debugger";
 import { GodotDebugSession } from "./debug_session";
 import { get_sub_values, parse_next_scene_node, split_buffers } from "./helpers";
-import { VariantDecoder } from "./variables/variant_decoder";
+import { DecodedVariant, VariantDecoder } from "./variables/variant_decoder";
 import { VariantEncoder } from "./variables/variant_encoder";
 import { RawObject } from "./variables/variants";
+import { VariablesManager } from "./variables/variables_manager";
 
 const log = createLogger("debugger.controller", { output: "Godot Debugger" });
 const socketLog = createLogger("debugger.socket");
@@ -32,7 +33,7 @@ const bbcodeParser = new BBCodeToAnsi("\u001b[38;2;211;211;211m");
 class Command {
 	public command = "";
 	public paramCount = -1;
-	public parameters = [];
+	public parameters: DecodedVariant[] = [];
 	public complete = false;
 	public threadId = 0;
 }
@@ -58,7 +59,7 @@ class GodotPartialStackVars {
 		const scopeName = ["Locals", "Members", "Globals"][godotScopeIndex];
 		const scope = this[scopeName];
 		// const objectId = value instanceof ObjectId ? value : undefined; // won't work, unless the value is re-created through new ObjectId(godot_id)
-		const godot_id = type === 24 ? value.id : undefined;
+		const godot_id = type === 24 ? value?.id : undefined;
 		scope.push({ id: godot_id, name, value, type, sub_values } as GodotVariable);
 		this.remaining--;
 	}
@@ -75,7 +76,7 @@ export class ServerController {
 	private socket?: net.Socket;
 	private steppingOut = false;
 	private didFirstOutput = false;
-	private partialStackVars: GodotPartialStackVars;
+	private partialStackVars?: GodotPartialStackVars;
 	private projectVersionMajor: number;
 	private projectVersionMinor: number;
 	private projectVersionPoint: number;
@@ -212,7 +213,7 @@ export class ServerController {
 			}
 		}
 
-		this.setProjectVersion(result.version);
+		this.setProjectVersion(result.version || "");
 
 		let command = `"${godotPath}" --path "${args.project}"`;
 		const address = args.address.replace("tcp://", "");
@@ -234,7 +235,14 @@ export class ServerController {
 			log.info(`Custom scene argument provided: ${args.scene}`);
 			let filename = args.scene;
 			if (args.scene === "current") {
-				let path = window.activeTextEditor.document.fileName;
+				let path = window.activeTextEditor?.document.fileName;
+				if (path === undefined) {
+					const message = "No active editor. Open a file to launch it.";
+					log.warn(message);
+					window.showErrorMessage(message, "Ok");
+					this.abort();
+					return;
+				}
 				if (path.endsWith(".gd")) {
 					path = path.replace(".gd", ".tscn");
 					if (!fs.existsSync(path)) {
@@ -285,7 +293,7 @@ export class ServerController {
 		debugProcess.on("close", (code) => {});
 	}
 
-	private stash: Buffer;
+	private stash?: Buffer;
 
 	private on_data(buffer: Buffer) {
 		if (this.stash) {
@@ -294,8 +302,7 @@ export class ServerController {
 		}
 
 		const buffers = split_buffers(buffer);
-		while (buffers.length > 0) {
-			const chunk = buffers.shift();
+		for (const chunk of buffers) {
 			const data = this.decoder.get_dataset(chunk)?.slice(1);
 			if (data === undefined) {
 				this.stash = Buffer.alloc(chunk.length);
@@ -304,7 +311,7 @@ export class ServerController {
 			}
 
 			socketLog.debug("rx:", data[0]);
-			const command = this.parse_message(data[0]);
+			const command = this.parse_message(data[0] as DecodedVariant[]);
 			this.handle_command(command);
 		}
 	}
@@ -385,21 +392,21 @@ export class ServerController {
 		this.server.listen(args.port, args.address);
 	}
 
-	private parse_message(dataset: []) {
+	private parse_message(dataset: DecodedVariant[]) {
 		const command = new Command();
 		let i = 0;
-		command.command = dataset[i++];
+		command.command = dataset[i++] as string;
 		if (this.projectVersionMinor >= 2) {
-			command.threadId = dataset[i++];
+			command.threadId = dataset[i++] as number;
 		}
-		command.parameters = dataset[i++];
+		command.parameters = dataset[i++] as DecodedVariant[];
 		return command;
 	}
 
 	private async handle_command(command: Command) {
 		switch (command.command) {
 			case "debug_enter": {
-				const reason: string = command.parameters[1];
+				const reason: string = command.parameters[1] as string;
 				if (reason !== "Breakpoint") {
 					this.set_exception(reason);
 				} else {
@@ -407,9 +414,12 @@ export class ServerController {
 				}
 				this.request_stack_dump();
 				this.request_scene_tree();
+				// variables_manager should be recreated for each "debug_enter"
+				this.session.variables_manager = new VariablesManager(this);
 				break;
 			}
 			case "debug_exit":
+				this.session.variables_manager = undefined;
 				break;
 			case "message:click_ctrl":
 				// TODO: what is this?
@@ -426,9 +436,13 @@ export class ServerController {
 				break;
 			}
 			case "scene:inspect_object": {
-				let godot_id = BigInt(command.parameters[0]);
-				const className: string = command.parameters[1];
-				const properties: string[] = command.parameters[2];
+				if (this.session.variables_manager === undefined) {
+					log.error("Unexpected 'scene:inspect_object' received. Should be inside 'debug_enter' / 'debug_exit'.");
+					return;
+				}
+				let godot_id = BigInt(command.parameters[0] as number);
+				const className: string = command.parameters[1] as string;
+				const properties: [string, string, number, string, number, any][] = command.parameters[2] as [string, string, number, string, number, any][];
 
 				// message:inspect_object returns the id as an unsigned 64 bit integer, but it is decoded as a signed 64 bit integer,
 				// thus we need to convert it to its equivalent unsigned value here.
@@ -436,11 +450,43 @@ export class ServerController {
 					godot_id = godot_id + BigInt(2) ** BigInt(64);
 				}
 
+				// SceneDebuggerProperty is Pair<PropertyInfo, Variant>
+				// PropertyInfo:
+				// 	Variant::Type type = Variant::NIL;
+				// 	String name; 															// prop[0]
+				// 	StringName class_name; // For classes
+				// 	PropertyHint hint = PROPERTY_HINT_NONE;
+				// 	String hint_string;
+				// 	uint32_t usage = PROPERTY_USAGE_DEFAULT;  // propp[4]
+				// Variant:
+				// 	Variant value; 														// prop[5]
 				const rawObject = new RawObject(className);
+				let category = "";
 				for (const prop of properties) {
-					rawObject.set(prop[0], prop[5]);
+					const [name, class_name, hint, hint_string, usage, value, ...tail]: [string, string, number, string, number, any] = prop;
+					if (usage === 128) {
+						category = name;
+						continue; // not a variable - just a category grouping element for UI for subsequent items
+					}
+					let var_name: string;
+					if (category !== "") {
+						var_name = `${category}/${name}`;
+					} else {
+						if (name.startsWith("Members/")) {
+							var_name = name.slice("Members/".length);
+						} else if (name.startsWith("Constants/")) {
+							var_name = name.slice("Constants/".length);
+						} else if (name.includes("/")) {
+							var_name = name;
+						} else { // extra check for potential override values:
+							log.error(`Unknown property name: '${name}'. Expected it to start with "Members/" or "Constants/" or contain "/"`);
+							var_name = name;
+						}
+					}
+
+					rawObject.set(var_name, value);
 				}
-				const sub_values = get_sub_values(rawObject);
+				const sub_values = await get_sub_values(rawObject, this.session.variables_manager);
 
 				// race condition here:
 				// 0. DebuggerStop1 happens
@@ -462,9 +508,9 @@ export class ServerController {
 				for (let i = 1; i < command.parameters.length; i += 3) {
 					frames.push({
 						id: frames.length,
-						file: command.parameters[i + 0],
-						line: command.parameters[i + 1],
-						function: command.parameters[i + 2],
+						file: command.parameters[i + 0] as string,
+						line: command.parameters[i + 1] as number,
+						function: command.parameters[i + 2] as string,
 					});
 				}
 
@@ -474,12 +520,11 @@ export class ServerController {
 			}
 			case "stack_frame_vars": {
 				/** first response to {@link request_stack_frame_vars} */
-				if (this.partialStackVars !== undefined) {
-					log.warn(
-						"'stack_frame_vars' received again from godot engine before all partial 'stack_frame_var' are received",
-					);
+				if (this.partialStackVars === undefined) {
+					log.warn("'stack_frame_vars' was received but `partialStackVars` is not initialized");
+					break;
 				}
-				const remaining = command.parameters[0];
+				const remaining = command.parameters[0] as number;
 				// init this.partialStackVars, which will be filled with "stack_frame_var" responses data
 				this.partialStackVars.reset(remaining);
 				break;
@@ -487,6 +532,10 @@ export class ServerController {
 			case "stack_frame_var": {
 				if (this.partialStackVars === undefined) {
 					log.error("Unexpected 'stack_frame_var' received. Should have received 'stack_frame_vars' first.");
+					return;
+				}
+				if (this.session.variables_manager === undefined) {
+					log.error("Unexpected 'stack_frame_var' received. Should be inside 'debug_enter' / 'debug_exit'.");
 					return;
 				}
 				if (typeof command.parameters[0] !== "string") {
@@ -514,7 +563,7 @@ export class ServerController {
 				const scope: 0 | 1 | 2 = command.parameters[1]; // 0 = locals, 1 = members, 2 = globals
 				const type: number = command.parameters[2];
 				const value: any = command.parameters[3];
-				const subValues: GodotVariable[] = get_sub_values(value);
+				const subValues: GodotVariable[] = await get_sub_values(value, this.session.variables_manager);
 				this.partialStackVars.append(name, scope, type, value, subValues);
 
 				if (this.partialStackVars.remaining === 0) {
@@ -547,8 +596,9 @@ export class ServerController {
 					// this.request_scene_tree();
 				}
 				const console = debug.activeDebugConsole;
-				for (const output of command.parameters[0]) {
-					for (const line of output.split("\n")) {
+				const params = command.parameters[0] as DecodedVariant[];
+				for (const output of params) {
+					for (const line of (output as string || "").split("\n")) {
 						console.appendLine(bbcodeParser.parse(line));
 					}
 				}
@@ -577,16 +627,17 @@ export class ServerController {
 			error: params[7] as string,
 			desc: params[8] as string,
 			warning: params[9] as boolean,
-			stack: [],
+			stack: [] as { msg: string; extras: any }[],
 		};
-		const stackCount = params[10] ?? 0;
+		const stackCount = params[10] as number ?? 0;
 		for (let i = 0; i < stackCount; i += 3) {
-			const file = params[11 + i];
-			const func = params[12 + i];
-			const line = params[13 + i];
+			const file = params[11 + i] as string;
+			const func = params[12 + i] as string;
+			const line = params[13 + i] as number;
 			const msg = `${file.slice("res://".length)}:${line} @ ${func}()`;
+			const uri = await convert_resource_path_to_uri(file);
 			const extras = {
-				source: { name: (await convert_resource_path_to_uri(file)).toString() },
+				source: { name: uri?.toString() ?? "" },
 				line: line,
 			};
 			e.stack.push({ msg: msg, extras: extras });
@@ -601,8 +652,9 @@ export class ServerController {
 		const color = e.warning ? "yellow" : "red";
 		const lang = e.file.startsWith("res://") ? "GDScript" : "C++";
 
+		const uri = await convert_resource_path_to_uri(e.file);
 		const extras = {
-			source: { name: (await convert_resource_path_to_uri(e.file)).toString() },
+			source: { name: uri?.toString() ?? "" },
 			line: e.line,
 			group: "startCollapsed",
 		};
@@ -661,7 +713,7 @@ export class ServerController {
 			if (error) {
 				log.error(error);
 			}
-			this.server.unref();
+			this.server?.unref();
 			this.server = undefined;
 		});
 	}
@@ -735,6 +787,9 @@ export class ServerController {
 
 		while (!this.draining && this.commandBuffer.length > 0) {
 			const command = this.commandBuffer.shift();
+			if (command === undefined) {
+				break;
+			}
 			this.draining = !this.socket.write(command);
 		}
 	}

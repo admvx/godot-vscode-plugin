@@ -30,7 +30,7 @@ export enum ManagerStatus {
 }
 
 export class ClientConnectionManager {
-	public client: GDScriptLanguageClient = null;
+	public client: GDScriptLanguageClient;
 
 	private statusChanged = new EventEmitter<ManagerStatus>();
 	onStatusChanged = this.statusChanged.event;
@@ -39,7 +39,7 @@ export class ClientConnectionManager {
 
 	private target: TargetLSP = TargetLSP.EDITOR;
 	private status: ManagerStatus = ManagerStatus.INITIALIZING;
-	private statusWidget: vscode.StatusBarItem = null;
+	private statusWidget: vscode.StatusBarItem;
 
 	private connectedVersion = "";
 
@@ -75,7 +75,9 @@ export class ClientConnectionManager {
 
 	private create_new_client() {
 		const port = this.client?.port ?? -1;
+		this.client?.io?.removeAllListeners();
 		this.client?.events?.removeAllListeners();
+		this.client?.stop(); // fire and forget
 		this.client = new GDScriptLanguageClient();
 		this.client.port = port;
 		this.client.events.on("status", this.on_client_status_changed.bind(this));
@@ -84,7 +86,7 @@ export class ClientConnectionManager {
 	private async connect_to_language_server() {
 		this.client.port = -1;
 		this.target = TargetLSP.EDITOR;
-		this.connectedVersion = undefined;
+		this.connectedVersion = "";
 
 		if (get_configuration("lsp.headless")) {
 			this.target = TargetLSP.HEADLESS;
@@ -111,14 +113,14 @@ export class ClientConnectionManager {
 		const projectVersion = await get_project_version();
 		let minimumVersion = "6";
 		let targetVersion = "3.6";
-		if (projectVersion.startsWith("4")) {
+		if (projectVersion?.startsWith("4")) {
 			minimumVersion = "2";
 			targetVersion = "4.2";
 		}
-		const settingName = `editorPath.godot${projectVersion[0]}`;
+		const settingName = `editorPath.godot${projectVersion?.[0] || ""}`;
 		let godotPath = get_configuration(settingName);
 
-		const result = verify_godot_version(godotPath, projectVersion[0]);
+		const result = verify_godot_version(godotPath, projectVersion?.[0] || "");
 		godotPath = result.godotPath;
 
 		switch (result.status) {
@@ -133,9 +135,9 @@ export class ClientConnectionManager {
 				return;
 			}
 		}
-		this.connectedVersion = result.version;
+		this.connectedVersion = result.version || "";
 
-		if (result.version[2] < minimumVersion) {
+		if (result.version && result.version[2] < minimumVersion) {
 			const message = `Cannot launch headless LSP: Headless LSP mode is only available on v${targetVersion} or newer, but the specified Godot executable is v${result.version}.`;
 			vscode.window
 				.showErrorMessage(message, "Select Godot executable", "Open Settings", "Disable Headless LSP", "Ignore")
@@ -328,6 +330,8 @@ export class ClientConnectionManager {
 	private retry_connect_client() {
 		const autoRetry = get_configuration("lsp.autoReconnect.enabled");
 		const maxAttempts = get_configuration("lsp.autoReconnect.attempts");
+		// const autoRetry = false; //get_configuration("lsp.autoReconnect.enabled");
+		// const maxAttempts = 1; //get_configuration("lsp.autoReconnect.attempts");
 		if (autoRetry && this.reconnectionAttempts <= maxAttempts - 1) {
 			this.reconnectionAttempts++;
 			this.client.connect(this.target);
