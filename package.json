@@ -2,7 +2,7 @@
 	"name": "godot-tools",
 	"displayName": "godot-tools",
 	"icon": "icon.png",
-	"version": "2.6.1",
+	"version": "2.7.1",
 	"description": "Tools for game development with Godot Engine and GDScript",
 	"repository": {
 		"type": "git",
@@ -919,7 +919,7 @@
 		"ts-node": "^10.9.1",
 		"tsconfig-paths": "^4.2.0",
 		"tslint": "^5.20.1",
-		"typescript": "^5.2.2"
+		"typescript": "^5.9.3"
 	},
 	"dependencies": {
 		"@vscode/debugadapter": "^1.68.0",
