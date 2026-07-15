@@ -6,3 +6,5 @@ workspace.code-workspace
 .history
 .godot
 *.tmp
+lode/
+test_projects/*/.vscode/settings.json
