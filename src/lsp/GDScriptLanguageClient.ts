@@ -85,6 +85,13 @@ type DocumentLinkResponseMessage = {
 	result: DocumentLinkResult[];
 };
 
+const stripBrackets = (rawString: string) => {
+	if (rawString.endsWith('(')) return rawString.slice(0, -1);
+	if (rawString.endsWith('()')) return rawString.slice(0, -2);
+	if (rawString.endsWith('($1)')) return rawString.replace('($1)', '$1');
+	return rawString;
+};
+
 export default class GDScriptLanguageClient extends LanguageClient {
 	public io: MessageIO = new MessageIO();
 
@@ -125,13 +132,10 @@ export default class GDScriptLanguageClient extends LanguageClient {
 					if (!items) return result;
 
 					for (const item of items) {
-						const insertText = item.insertText;
-						if (typeof insertText === 'string') {
-							if (insertText.endsWith('(')) {
-								item.insertText = insertText.slice(0, -1);
-							} else if (insertText.endsWith('()')) {
-								item.insertText = insertText.slice(0, -2);
-							}
+						if (typeof item.insertText === 'string') {
+							item.insertText = stripBrackets(item.insertText);
+						} else if (item.insertText != undefined) {
+							item.insertText.value = stripBrackets(item.insertText.value);
 						}
 					}
 					
